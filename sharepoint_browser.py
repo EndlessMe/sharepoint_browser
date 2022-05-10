@@ -14,6 +14,7 @@ import os
 sharepoint_url = 'https://pfizer.sharepoint.com/sites/'
 time_now = datetime.now(tzutc()).replace(hour=0, minute=0, second=0, microsecond=0)
 updated_files = []
+update_type = []
 modified_dates = []
 selected_directory = ''
 load_dotenv()
@@ -100,19 +101,26 @@ def select_folder(parent_folder, context):
         return select_folder(parent_folder, context)
 
 
-def crawl_folders(parent_folder, fn, time_delta):
+def crawl_folders(parent_folder, fn, time_delta, mode='both'):
     """
     :param parent_folder: str - Root Folder to start crawling for updates
     :param fn: func - function to run on files in sharepoint site
     :param time_delta: int - Representation of number of days to lookup for updates
+    :param mode: str - Either new files only, modified files only, or both modified/new files.
     """
     parent_folder.expand(['Files', 'Folders']).get().execute_query()
-    # First check every file's last modified date in the current directory
-    for file in parent_folder.files:
-        fn(file, time_delta)
-    # Then repeat the process for each folder recursively
-    for folder in parent_folder.folders:
-        crawl_folders(folder, fn, time_delta)
+    if mode == 'new_folder':
+        for folder in parent_folder.folders:
+            fn(folder, time_delta, mode)
+        for folder in parent_folder.folders:
+            crawl_folders(folder, fn, time_delta, mode)
+    else:
+        # First check every file's last modified date in the current directory
+        for file in parent_folder.files:
+            fn(file, time_delta, mode)
+        # Then repeat the process for each folder recursively
+        for folder in parent_folder.folders:
+            crawl_folders(folder, fn, time_delta, mode)
 
 
 # def search_sharepoint(context, doc_index):
@@ -127,22 +135,53 @@ def crawl_folders(parent_folder, fn, time_delta):
 #     return search_results
 
 
-def find_recent_updates(f, time_delta):
+def add_discovered_file_to_lists(path, file_type, date):
+    updated_files.append(path)
+    update_type.append(file_type)
+    modified_dates.append(date)
+    if file_type == 'new_folder':
+        print('Found new folder:', path, date)
+    else:
+        print('Found {0} file:'.format(file_type), path, date)
+
+
+def find_recent_updates(f, time_delta, mode='both'):
     """
     :param f: obj - File to check for modified date.
     :param time_delta: int - Representation of number of days to perform search for updated files
+    :param mode: str - Which search mode to perform. New files only, modified files only, or both modified and new files.
     """
     path = f.properties['ServerRelativeUrl']
-    date = f.properties['TimeLastModified']
     created_date = dateutil.parser.parse(f.properties['TimeCreated'])
-    modified_date = dateutil.parser.parse(date)
-    if time_now - created_date < time_delta or time_now - modified_date < time_delta:
-        updated_files.append(path)
-        modified_dates.append(date)
-        print('Found updated file:', path, date)
+    modified_date = dateutil.parser.parse(f.properties['TimeLastModified'])
+    search_mode = mode
+    if search_mode == 'both':
+        if time_now - created_date < time_delta:
+            add_discovered_file_to_lists(path=path, file_type='new', date=created_date)
+        elif time_now - modified_date < time_delta:
+            add_discovered_file_to_lists(path=path, file_type='modified', date=modified_date)
+    elif search_mode == 'new':
+        if time_now - created_date < time_delta:
+            add_discovered_file_to_lists(path=path, file_type=search_mode, date=created_date)
+    elif search_mode == 'new_folder':
+        if time_now - created_date < time_delta:
+            add_discovered_file_to_lists(path=path, file_type=search_mode, date=created_date)
+    elif search_mode == 'modified':
+        if time_now - modified_date < time_delta:
+            add_discovered_file_to_lists(path=path, file_type=search_mode, date=modified_date)
 
 
-def export_results(files, dates, site_name, time_delta):
+def transform_paths_to_urls(dataframe):
+    df = dataframe.copy(deep=True)
+    df['path'] = df['path'].map(lambda x: x.split('/'))
+    df['name'] = df['path'].map(lambda x: x.pop())
+    df['path'] = df['path'].map(lambda x: '/'.join(x))
+    df['path'] = df['path'].map(lambda x: x.replace(' ', '%20'))
+    df['path'] = 'https://pfizer.sharepoint.com' + df['path'].astype(str)
+    return df[['path', 'name', 'file_type', 'date']]
+
+
+def export_results(files, dates, file_type, site_name, time_delta):
     """
     Export results to CSV file.
     :param files: list - Takes in the array of discovered file paths during processing
@@ -151,21 +190,24 @@ def export_results(files, dates, site_name, time_delta):
     :param time_delta: int - The user-specified lookup time. Used in generating the filename.
     :return: None. Generates CSV file of results in working directory and prints informative message of location.
     """
-    file_df = pd.DataFrame.from_dict({'file_path': files, 'last_modified': dates}, orient='index').transpose()
+    file_df = pd.DataFrame.from_dict({'path': files, 'file_type': file_type, 'date': dates}, orient='index').transpose()
+    transformed_df = transform_paths_to_urls(file_df)
     file_name = site_name.lower() + '_modified_files_' + (str(time_now - time_delta)).split(' ')[0] + '_to_' + \
         str(time_now).split(' ')[0] + '.csv'
     print('Writing file to disk...')
-    file_df.to_csv(file_name, index=False)
+    # file_df.to_csv(file_name, index=False)
+    transformed_df.to_csv(file_name, index=False)
     print('Results are located in', file_name)
 
 
-def process(site_name, time_delta, browse_path='/Shared Documents/', browse_mode=False):
+def process(site_name, time_delta, browse_path='/Shared Documents/', browse_mode=False, search_mode='both'):
     """
     Routine that handles orchestration of SharePoint browser. Completes with CSV file of results.
     :param site_name: str - SharePoint site name
     :param time_delta: int - User-specified amount of time to use for the range of days from present
     :param browse_path: str - Location to begin searching for updated files
     :param browse_mode: bool - Determines whether to initiate interactive mode
+    :param search_mode: str - Determines whether to search for new files, updated files, or both.
     :return: None. Calls export_results to export results to CSV file.
     """
     try:
@@ -185,7 +227,7 @@ def process(site_name, time_delta, browse_path='/Shared Documents/', browse_mode
         else:
             root_folder = ctx.web.get_folder_by_server_relative_url(folder_url)
         print('Crawling files and folders...')
-        crawl_folders(parent_folder=root_folder, fn=find_recent_updates, time_delta=time_delta)
+        crawl_folders(parent_folder=root_folder, fn=find_recent_updates, time_delta=time_delta, mode=search_mode)
         print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
         print('Complete!')
     except ClientRequestException:
@@ -203,6 +245,13 @@ if __name__ == '__main__':
         site_name = list(name_to_site_mapping().values())[target_site]
         days = int(input("Enter desired number of days prior to today that you'd like to check for updates: "))
         lookup_days = timedelta(days=days)
+        print()
+        print("[0] New files only")
+        print("[1] New folders only")
+        print("[2] Modified files only")
+        print("[3] Both new and modified files")
+        update_search_mode = int(input("Choose the number for the search mode you'd like to use from the options above: "))
+        modes = ['new', 'new_folder', 'modified', 'both']
         # Allow option to search a directory other than root Shared Documents directory
         search_named_folder = str(input("Would you like to search a specific directory? Enter 'N' to search this entire SharePoint site. Y/N: "))
         if search_named_folder.lower() == 'y' or search_named_folder.lower() == 'yes':
@@ -210,21 +259,21 @@ if __name__ == '__main__':
             browse_dirs = str(input("Do you know the path to the directory? Enter 'N' to initiate browse mode: "))
             # If user does not know path, enter interactive browse mode.
             if browse_dirs.lower() == 'n' or browse_dirs.lower() == 'no':
-                process(site_name=site_name, time_delta=lookup_days, browse_mode=True)
-                export_results(files=updated_files, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
+                process(site_name=site_name, time_delta=lookup_days, browse_mode=True, search_mode=modes[update_search_mode])
+                export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
             # Otherwise, prompt user for path. Useful if users have direct path saved in a note somewhere.
             # SharePoint is terrible at granting the ability to directly copy the absolute path from the web.
             elif browse_dirs.lower() == 'y' or browse_dirs.lower() == 'yes':
                 print('Enter path to folder. Path is case-sensitive!')
                 path = "/Shared Documents/" + str(input("{0}/Documents/".format(site_name)))
-                process(site_name=site_name, time_delta=lookup_days, browse_path=path)
-                export_results(files=updated_files, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
+                process(site_name=site_name, time_delta=lookup_days, browse_path=path, search_mode=modes[update_search_mode])
+                export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
             else:
                 print("Please enter 'Y' to search a specific directory path, or 'N' to enter interactive browse mode.")
         # Search root site directory
         elif search_named_folder.lower() == 'n' or search_named_folder.lower() == 'no':
-            process(site_name=site_name, time_delta=lookup_days)
-            export_results(files=updated_files, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
+            process(site_name=site_name, time_delta=lookup_days, search_mode=modes[update_search_mode])
+            export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
         else:
             print('Input either "yes" or "no" and try again.')
     except AttributeError:
