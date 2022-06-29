@@ -12,6 +12,7 @@ import dateutil.parser
 import pandas as pd
 import getpass
 import os
+import argparse
 
 
 # Variables
@@ -38,9 +39,21 @@ def authenticate_app():
     return token
 
 
+def authenticate_cli_user(site_url, user, pwd):
+    """
+    :param: site_url: str - URL of SharePoint site to be crawled for updates. Used for authentication
+    :return: Authenticated context object
+    """
+    try:
+        user_creds = UserCredential(user + '@pfizer.com', pwd)
+        return ClientContext(site_url).with_credentials(user_creds)
+    except IndexError:
+        print('Authentication Error.')
+
+
 def authenticate_user(site_url):
     """
-    :param site_url: str - URL of SharePoint site to be crawled for updates. Used for authentication.
+    :param: site_url: str - URL of SharePoint site to be crawled for updates. Used for authentication.
     :return: Authenticated context object
     """
     # Take in SharePoint site URL, prompt for username and password, return OAuth token.
@@ -211,7 +224,7 @@ def export_results(files, dates, file_type, site_name, time_delta):
     print('Results are located in', file_name)
 
 
-def process(site_name, time_delta, browse_path='/Shared Documents/', browse_mode=False, search_mode='both'):
+def process(site_name, time_delta, browse_path='/Shared Documents/', browse_mode=False, search_mode='both', cli=False, user=None, pwd=None):
     """
     Routine that handles orchestration of SharePoint browser. Completes with CSV file of results.
     :param site_name: str - SharePoint site name
@@ -219,78 +232,112 @@ def process(site_name, time_delta, browse_path='/Shared Documents/', browse_mode
     :param browse_path: str - Location to begin searching for updated files
     :param browse_mode: bool - Determines whether to initiate interactive mode
     :param search_mode: str - Determines whether to search for new files, updated files, or both.
+    :param cli: boolean - Determines whether to process using CLI mode or Interactive mode
     :return: None. Calls export_results to export results to CSV file.
     """
     try:
-        site_url = sharepoint_url + site_name
-        time_delta = time_delta
-        ctx = authenticate_user(site_url=site_url)
-        # ctx = authenticate_app()
-        web = ctx.web
-        ctx.load(web)
-        # client = GraphClient(ctx)
-        ctx.execute_query()
-        # client.drives.get().execute_query()
-        site_title = web.properties['Title']
+        if not cli:
+            site_url = sharepoint_url + site_name
+            time_delta = time_delta
+            ctx = authenticate_user(site_url=site_url)
+            # ctx = authenticate_app()
+            web = ctx.web
+            ctx.load(web)
+            # client = GraphClient(ctx)
+            ctx.execute_query()
+            # client.drives.get().execute_query()
+            site_title = web.properties['Title']
 
-        print('Authenticated into sharepoint site: ', site_title)
-        folder_url = '/sites/' + site_name + browse_path
-        if browse_mode:
-            selected_root_folder = select_folder(folder_url, ctx)
-            print('Selected root folder =', selected_root_folder)
-            root_folder = ctx.web.get_folder_by_server_relative_url(selected_root_folder)
+            print('Authenticated into sharepoint site: ', site_title)
+            folder_url = '/sites/' + site_name + browse_path
+            if browse_mode:
+                selected_root_folder = select_folder(folder_url, ctx)
+                print('Selected root folder =', selected_root_folder)
+                root_folder = ctx.web.get_folder_by_server_relative_url(selected_root_folder)
+            else:
+                root_folder = ctx.web.get_folder_by_server_relative_url(folder_url)
+            print('Crawling files and folders...')
+            crawl_folders(parent_folder=root_folder, fn=find_recent_updates, time_delta=time_delta, mode=search_mode)
+            print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+            print('Complete!')
         else:
-            root_folder = ctx.web.get_folder_by_server_relative_url(folder_url)
-        print('Crawling files and folders...')
-        crawl_folders(parent_folder=root_folder, fn=find_recent_updates, time_delta=time_delta, mode=search_mode)
-        print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
-        print('Complete!')
+            ctx = authenticate_cli_user(site_url=sharepoint_url+site_name, user=user, pwd=pwd)
+            web = ctx.web
+            ctx.load(web)
+            ctx.execute_query()
+            site_title = web.properties['Title']
+            print('Authenticated into sharepoint site: ', site_title)
+            root_folder = ctx.web.get_folder_by_server_relative_url(browse_path)
+            crawl_folders(parent_folder=root_folder, fn=find_recent_updates, time_delta=time_delta, mode=search_mode)
+            print('~~~~~~~~~~~~~~~~~~~~~~~~~~~~~')
+            print('Complete!')
     except ClientRequestException:
         print('No Sharepoint site found with provided directory path value entered. Please try again.')
 
 
 def main():
-    key_index = 0
-    print('')
-    for name in name_to_site_mapping():
-        print("[{0}] {1}".format(key_index, name))
-        key_index += 1
+    parser = argparse.ArgumentParser(description="Command Line Interface for Hermes")
+    parser.add_argument("--path", help="The direct path to the target SharePoint directory", required=False, type=str, default="")
+    parser.add_argument("--days", help="Number of days prior to today to check for updates", required=False, type=int, default=14)
+    parser.add_argument("--user", help="Pfizer Username (string)", required=False, type=str, default="")
+    parser.add_argument("--pwd", help="Password (string)", required=False, type=str, default="")
+    parser.add_argument("--mode", help="Search mode (new, new_folder, modified, or both) to use (string)", required=False, type=str, default="both")
+    argument = parser.parse_args()
+    cli_status = False
+    if argument.path:
+        cli_status = True
     try:
-        target_site = int(input("Enter number for SharePoint site you'd like to check for updates: "))
-        site_name = list(name_to_site_mapping().values())[target_site]
-        days = int(input("Enter desired number of days prior to today that you'd like to check for updates: "))
-        lookup_days = timedelta(days=days)
-        print()
-        print("[0] New files only")
-        print("[1] New folders only")
-        print("[2] Modified files only")
-        print("[3] Both new and modified files")
-        update_search_mode = int(input("Choose the number for the search mode you'd like to use from the options above: "))
-        modes = ['new', 'new_folder', 'modified', 'both']
-        # Allow option to search a directory other than root Shared Documents directory
-        search_named_folder = str(input("Would you like to search a specific directory? Enter 'N' to search this entire SharePoint site. Y/N: "))
-        if search_named_folder.lower() == 'y' or search_named_folder.lower() == 'yes':
-            # Give user option of browsing SharePoint site directory structure.
-            browse_dirs = str(input("Do you know the path to the directory? Enter 'N' to initiate browse mode: "))
-            # If user does not know path, enter interactive browse mode.
-            if browse_dirs.lower() == 'n' or browse_dirs.lower() == 'no':
-                process(site_name=site_name, time_delta=lookup_days, browse_mode=True, search_mode=modes[update_search_mode])
-                export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
-            # Otherwise, prompt user for path. Useful if users have direct path saved in a note somewhere.
-            # SharePoint is terrible at granting the ability to directly copy the absolute path from the web.
-            elif browse_dirs.lower() == 'y' or browse_dirs.lower() == 'yes':
-                print('Enter path to folder. Path is case-sensitive!')
-                path = "/Shared Documents/" + str(input("{0}/Documents/".format(site_name)))
-                process(site_name=site_name, time_delta=lookup_days, browse_path=path, search_mode=modes[update_search_mode])
+        if cli_status is True:
+            # This assumes that the Copy Link button is being used in SharePoint
+            site_name = argument.path.split('/')[6]
+            copy_link = argument.path.split('?')[0]
+            folder_path = '/sites/' + site_name + copy_link.split(site_name)[1].replace('%20', ' ')
+            lookup_days = timedelta(days=argument.days)
+            process(site_name=site_name, time_delta=lookup_days, browse_path=folder_path,
+                    search_mode=argument.mode, cli=True, user=argument.user, pwd=argument.pwd)
+            export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name,
+                           time_delta=lookup_days)
+        else:
+            key_index = 0
+            print('')
+            for name in name_to_site_mapping():
+                print("[{0}] {1}".format(key_index, name))
+                key_index += 1
+            target_site = int(input("Enter number for SharePoint site you'd like to check for updates: "))
+            site_name = list(name_to_site_mapping().values())[target_site]
+            days = int(input("Enter desired number of days prior to today that you'd like to check for updates: "))
+            lookup_days = timedelta(days=days)
+            print()
+            print("[0] New files only")
+            print("[1] New folders only")
+            print("[2] Modified files only")
+            print("[3] Both new and modified files")
+            update_search_mode = int(input("Choose the number for the search mode you'd like to use from the options above: "))
+            modes = ['new', 'new_folder', 'modified', 'both']
+            # Allow option to search a directory other than root Shared Documents directory
+            search_named_folder = str(input("Would you like to search a specific directory? Enter 'N' to search this entire SharePoint site. Y/N: "))
+            if search_named_folder.lower() == 'y' or search_named_folder.lower() == 'yes':
+                # Give user option of browsing SharePoint site directory structure.
+                browse_dirs = str(input("Do you know the path to the directory? Enter 'N' to initiate browse mode: "))
+                # If user does not know path, enter interactive browse mode.
+                if browse_dirs.lower() == 'n' or browse_dirs.lower() == 'no':
+                    process(site_name=site_name, time_delta=lookup_days, browse_mode=True, search_mode=modes[update_search_mode])
+                    export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
+                # Otherwise, prompt user for path. Useful if users have direct path saved in a note somewhere.
+                # SharePoint is terrible at granting the ability to directly copy the absolute path from the web.
+                elif browse_dirs.lower() == 'y' or browse_dirs.lower() == 'yes':
+                    print('Enter path to folder. Path is case-sensitive!')
+                    path = "/Shared Documents/" + str(input("{0}/Documents/".format(site_name)))
+                    process(site_name=site_name, time_delta=lookup_days, browse_path=path, search_mode=modes[update_search_mode])
+                    export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
+                else:
+                    print("Please enter 'Y' to search a specific directory path, or 'N' to enter interactive browse mode.")
+            # Search root site directory
+            elif search_named_folder.lower() == 'n' or search_named_folder.lower() == 'no':
+                process(site_name=site_name, time_delta=lookup_days, search_mode=modes[update_search_mode])
                 export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
             else:
-                print("Please enter 'Y' to search a specific directory path, or 'N' to enter interactive browse mode.")
-        # Search root site directory
-        elif search_named_folder.lower() == 'n' or search_named_folder.lower() == 'no':
-            process(site_name=site_name, time_delta=lookup_days, search_mode=modes[update_search_mode])
-            export_results(files=updated_files, file_type=update_type, dates=modified_dates, site_name=site_name, time_delta=lookup_days)
-        else:
-            print('Input either "yes" or "no" and try again.')
+                print('Input either "yes" or "no" and try again.')
     except AttributeError:
         print('Unable to authenticate with credentials. Please try again.')
     except IndexError:
